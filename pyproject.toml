@@ -15,12 +15,9 @@ documentation = "https://xtb-docs.readthedocs.io/en/latest/CENSO_docs/censo.html
 dev = ["black", "pytest", "tox"]
 scripts = [
     "numpy",
-    "matplotlib",
+    "matplotlip",
     "pandas"
 ]
-
-[project.scripts]
-censo = "censo.cli.interface:entry_point"
 
 [tool.setuptools.dynamic]
 readme = {file = "README.md"}

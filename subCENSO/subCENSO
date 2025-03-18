@@ -1,0 +1,325 @@
+#!/usr/bin/env python
+import getpass
+import os
+import sys
+import time
+import re
+import socket 
+import shutil
+
+#Function to define user account
+def write_sbatch_account(sub_info, sh_file):
+    """
+    Writes the appropriate SBATCH account line based on the 'account' key in sub_info.
+
+    Parameters:
+    sub_info (dict): A dictionary containing submission info, including the 'account' key.
+    sh_file (file object): The open file object to write the SBATCH line to.
+    """
+    
+    sh_file.write('#!/bin/bash\n\n')
+    
+    if sub_info['account'] == 'rrg':
+        sh_file.write(f'#SBATCH --account=rrg-shopkins-ab\n')
+    elif sub_info['account'] == 'derek':
+        sh_file.write(f'#SBATCH --account=def-schipper\n')
+    else:
+        sh_file.write(f'#SBATCH --account=def-shopkins\n')
+
+#Function to check if you are on a DRAC/Compute canada cluster. Returns Tue is you are and false if you are not. 
+def DRAC_cluster_check(cluster_name):
+    
+    #dictionary for store names and pseudonyms for DRAC clusters
+    cluster_names = {
+        'narval' : ['narval', 'calcul', 'quebec'], #Server Name: narval3.narval.calcul.quebec
+        'graham' : ['gra', 'login'], #Server Name: gra-login2
+        'cedar' : ['computecanada', 'cedar'], #Server Name: cedar1.int.cedar.computecanada.ca
+        'beluga' : ['beluga', 'calcul', 'quebec'], #Server name: beluga4.int.ets1.calculquebec.ca
+        'niagara' : ['compute', 'canada', 'niagara']
+    }
+
+    for pseudonyms in cluster_names.values():
+        
+        #Iterate over dict entries to see if the cluster name. If match, return true. Otherwise return false
+        if any(pseudo in cluster_name for pseudo in pseudonyms):
+            return True 
+        
+    return False #only return false if no matches are found
+
+# Function to prepare job files and directories for each .xyz file
+def prepare_job_files(sub_info):
+    # Get all .xyz files in the current directory
+    xyz_files = [f for f in os.listdir(os.getcwd()) if f.endswith('.xyz')]
+
+    #read censo .py runfile
+    py_files = [file for file in os.listdir(os.getcwd()) if file.endswith('.py')]
+    
+    # Use the first .py file found, or set a default value if none are found
+    if py_files:
+        censo_config_file = os.path.join(os.getcwd(), py_files[0]) #define censo py subfile as first instance of matching py files - there should never be mroe than one
+    else:
+        raise FileNotFoundError("No .py files found in the current directory.")
+
+
+    for xyz_file in xyz_files:
+        # Create directory for each .xyz file
+        base_name = os.path.basename(xyz_file).split(".")[0]
+        job_dir = os.path.join(os.getcwd(), base_name)
+        os.makedirs(job_dir, exist_ok=True)
+        
+        # Copy .xyz file to the new directory
+        shutil.copy2(xyz_file, f'{os.path.join(job_dir, base_name)}.xyz')
+
+        # Determine and copy the correct .censo2rc file based on -s argument
+        censo2rc_file = f"{'gas' if sub_info['solv'].lower() == 'gas' else 'solv'}.censo2rc"
+        if os.path.isfile(censo2rc_file):
+            target_censo2rc = os.path.join(job_dir, f'{base_name}.censo2rc')
+            shutil.copy2(censo2rc_file, target_censo2rc)
+        else:
+            print(f"Config file '{censo2rc_file}' not found.")
+            return
+
+        # Copy and rename censo_config.py file
+        with open(censo_config_file, 'r') as file:
+            config_content = file.readlines()
+                   
+        target_py_file = os.path.join(job_dir, f'{base_name}.py')
+
+        with open(target_py_file, 'w') as file:
+            for line in config_content:
+                # Replace 'workdir'
+                if line.lower().startswith('workdir'):
+                    file.write(f'workdir = "{job_dir}"\n')
+
+                # Replace 'ensemble.read_input'
+                elif line.lower().startswith('ensemble.read'):
+                    file.write(f'ensemble.read_input(input_path, charge={sub_info["charge"]}, unpaired={sub_info["unpaired"]})\n')
+
+                # Replace 'Config.NCORES'
+                elif line.lower().startswith('config.ncores'):
+                    file.write(f'Config.NCORES={sub_info["ncores"]}\n')
+
+                # Write other lines as they are
+                else:
+                    file.write(line)
+                    
+        # Create and submit the SLURM job file
+        submit_file(job_dir, base_name, sub_info)
+
+# Function to submit a job file
+def submit_file(directory, file_name, sub_info):
+    cluster_name = str(socket.gethostname()).lower()
+    CC_cluster = DRAC_cluster_check(cluster_name)
+
+    timestamp = time.strftime('%Y-%m-%d_%H-%M-%S')
+    sh_file_path = os.path.join(directory, f'{file_name}_{timestamp}.sh')
+
+    base_filename = os.path.join(directory, file_name)
+
+    with open(sh_file_path, 'w') as sh_file:
+        write_sbatch_account(sub_info, sh_file)
+        sh_file.writelines([
+            f'#SBATCH --time={sub_info["time"]}\n',
+            '#SBATCH -N 1\n',
+            f'#SBATCH --ntasks={sub_info["ncores"]}\n',
+            f'#SBATCH --mem-per-cpu={sub_info["memory"]}\n',
+            f'#SBATCH --output={base_filename}.out\n',  
+            f'#SBATCH --error={base_filename}.err\n\n',   
+        ])
+        
+        if CC_cluster:
+            sh_file.write('# Load modules needed to run CENSO\n')
+            sh_file.write('module load StdEnv/2023 gcc/12.3 openmpi/4.1.5 orca/6.0.1 xtb/6.7.1\n')
+            #sh_file.write('module load python/3.11\n\n') #uncomment if you need a specifc python version, but this should suffice
+            
+            #copy all censo files needed for job
+            sh_file.write('# Copy all job files to SLURM temp directory, then change direcotries to it\n')
+            sh_file.write(f'cp {base_filename}.xyz ${{SLURM_TMPDIR}}/\n')
+            sh_file.write(f'cp {base_filename}.py ${{SLURM_TMPDIR}}/\n')
+            sh_file.write(f'cp {base_filename}.censo2rc ${{SLURM_TMPDIR}}/\n')
+            sh_file.write('cd ${SLURM_TMPDIR}\n\n')
+
+            # Set up a trap to copy files back if the job is interrupted - directories will not be copied
+            sh_file.write('# Set up a trap to copy files back if the job is interrupted - directories will not be copied\n')
+            sh_file.write(f'trap "find ${{SLURM_TMPDIR}} -type f -exec cp {{}} {directory}/ \\;" EXIT\n\n')
+
+            # Run the Python script and get its PID
+            sh_file.write('# Run the Python script and get its PID\n')
+            sh_file.write(f'python {file_name}.py &\n')
+            sh_file.write('MAIN_PID=$!\n\n')
+
+            # Start a background process to copy files every 2 hours
+            sh_file.writelines([
+                '# Start a background process to copy files every 2 hours\n',
+                '(\n',
+                '    # Monitor the main job process and periodically copy files\n',
+                '    while kill -0 $MAIN_PID 2> /dev/null; do\n',
+                '        # Wait for 2 hours before attempting to copy files\n',
+                '        sleep 2h\n',
+                '        # Log the start of the rsync operation with a timestamp\n',
+                f'        echo "$(date): Starting rsync operation" >> {directory}/copy_log.txt\n',
+                '        # Use find to select files without "tmp" in their name and rsync to copy them\n',
+                f'        find ${{SLURM_TMPDIR}} -type f ! -name \'*tmp*\' -exec rsync -av --no-links {{}} {directory}/ \\; >> {directory}/copy_log.txt 2>&1\n',
+                '        # Check if rsync was successful and log the result\n',
+                '        if [ $? -eq 0 ]; then\n',
+                f'            echo "$(date): rsync operation completed successfully" >> {directory}/copy_log.txt\n',
+                '        else\n',
+                f'            echo "$(date): rsync operation failed" >> {directory}/copy_log.txt\n',
+                '        fi\n',
+                '    done\n',
+                ')&\n\n'
+            ])
+
+            # Wait for the main job to complete
+            sh_file.write('# When the main job completes, copy all output files back to the submit directory\n')
+            sh_file.write('wait $MAIN_PID\n')
+            sh_file.write(f'find ${{SLURM_TMPDIR}} -type f -exec rsync -axvH --no-g --no-p {{}} "{directory}/" \\;\n\n')
+        
+        #submission of CENSO files not on compute canada
+        else:
+            sh_file.write(f'srun python {file_name}.py;\n')
+
+    submit_command = f'sbatch {sh_file_path}'
+    try:
+        os.system(submit_command)
+        print(f'Submitted {os.path.basename(file_name)} successfully.')
+    except Exception as e:
+        print(f'An unexpected error occurred when submitting {os.path.basename(file_name)}: {e}')
+
+# Main execution logic
+def main():
+    args = [arg.lower() for arg in sys.argv]
+
+    #to add - error check for arguements 
+    sub_info = {
+        'ncores': '',
+        'memory': '',
+        'time': '',
+        'charge': '',
+        'unpaired': '',
+        'account': '',
+        'solv': ''
+    }
+
+    for i in range(1, len(args), 2):
+        if i+1 < len(args):
+            if args[i] == '-n':
+                sub_info['ncores'] = args[i + 1]
+            elif args[i] == '-m':
+                sub_info['memory'] = args[i + 1]
+            elif args[i] == '-t':
+                sub_info['time'] = args[i + 1]
+            elif args[i] == '-c':
+                sub_info['charge'] = args[i + 1]
+            elif args[i] == '-u':
+                sub_info['unpaired'] = args[i + 1]
+            elif args[i] == '-a':
+                sub_info['account'] = args[i + 1]
+            elif args[i] == '-s':
+                sub_info['solv'] = args[i + 1]
+
+
+    ############
+    # ERROR HANDLING FUNCTIONS
+    ############
+
+    #Function to check if a string represents an integer
+    def is_integer(s):
+        try:
+            int(s)
+            return True
+        except ValueError:
+            return False
+
+    #### NCORES CHECK ####
+    if not is_integer(sub_info['ncores']):
+        print(f'The number of cores provided is not an integer: {sub_info["ncores"]}.')
+        return
+
+    #### MEMORY CHECK ####
+    mem_str = sub_info['memory']
+
+    def check_memory(mem_str):
+        #Check if the string ends with 'mb' or 'gb'
+        if mem_str.lower().endswith('mb') or mem_str.lower().endswith('gb'):
+            if mem_str[:-2].isdigit():
+                return mem_str
+            else:
+                print(f'The memory specified needs to be an integer followed by "mb" or "gb". You have provided: {mem_str}')
+                return
+
+        #Check if the string ends with 'm' or 'g'
+        elif mem_str.lower().endswith('m') or mem_str.lower().endswith('g'):
+            #Ensure that all characters before 'm' or 'g' are numeric
+            if mem_str[:-1].isdigit():
+                return mem_str + 'b'
+            else:
+                print(f'The memory specified needs to be an integer followed by "m" or "g". You have provided: {mem_str}')
+                return
+        
+        else:
+            print(f'The memory specified needs to be an integer followed by "mb", "m", "gb", or "g". You have provided: {mem_str}')
+            return
+
+    #update dict entry w/ corrected memory        
+    sub_info['memory'] = check_memory(mem_str)
+    
+    #### WALTIME CHECK ####
+    def adjust_time_format(time_str):
+        
+        #Regex pattern to parse alphanumeric time strings in any order of the form 1d4h300m20s and 4h3d80s1m
+        pattern = re.compile(r'(?:(?P<days>\d+)d|(?P<hours>\d+)h|(?P<minutes>\d+)m|(?P<seconds>\d+)s)')
+
+        def parse_alphanumeric_time_string(time_string):
+            time_dict = {'days': 0, 'hours': 0, 'minutes': 0, 'seconds': 0}
+            matches = pattern.findall(time_string)
+            
+            #dummy dict to check for suplicate delimiters
+            seen = {'days': False, 'hours': False, 'minutes': False, 'seconds': False}
+            
+            for match in matches:
+                for key, value in zip(time_dict.keys(), match):
+                    if value:
+                        #check for duplicate delimiters
+                        if seen[key]:
+                            print(f'Error: Duplicate delimiter detected for {key} in time string: {time_string}')
+                            return None
+                        seen[key] = True
+                        time_dict[key] = int(value)
+            return time_dict
+
+        try:
+            #Check if the time string contains any of the required delimiters - throw an error if it doesnt
+            if not any(delimiter in time_str for delimiter in ['d', 'h', 'm', 's']):
+                print(f'The time string provided ({time_str}) is missing d, h, m, and s delimiters. Use the format ##d##h##m##s.')
+                return False
+            
+            time_dict = parse_alphanumeric_time_string(time_str)
+            
+            if time_dict is None:
+                return False
+                
+            #Format the time string for SLURM as 'dd-hh:mm:ss'
+            return f'{str(time_dict["days"]).zfill(2)}-{str(time_dict["hours"]).zfill(2)}:{str(time_dict["minutes"]).zfill(2)}:{str(time_dict["seconds"]).zfill(2)}'
+                    
+        except Exception as e:
+            print(f'An exception occurred while parsing the time string: {e}.')
+            return False
+
+    #update dict entry w/ corrected time    
+    time_str = sub_info['time']    
+    sub_info['time'] = adjust_time_format(time_str)
+
+    ############
+    # END ERROR HANDLING FUNCTIONS
+    ############
+
+    #exit code if time stirng was not parsed correctly 
+    if not sub_info['time']:
+        return
+
+    prepare_job_files(sub_info)
+
+if __name__ == '__main__':
+    main()
+
