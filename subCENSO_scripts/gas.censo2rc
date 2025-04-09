@@ -8,7 +8,7 @@ run = True
 template = False
 
 [screening]
-threshold = 3.6
+threshold = 3.2
 func = r2scan-3c
 basis = def2-TZVP
 prog = orca
@@ -21,7 +21,7 @@ template = False
 [optimization]
 optcycles = 10
 maxcyc = 200
-threshold = 3.2
+threshold = 2.5
 hlow = 0.01
 gradthr = 0.01
 func = r2scan-3c
